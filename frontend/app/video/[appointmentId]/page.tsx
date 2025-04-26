@@ -10,8 +10,10 @@ import VideoControls from '../../components/video/VideoControls';
 import DoctorWaitingRoom from '../../components/video/DoctorWaitingRoom';
 import { useVideo } from '../../hooks/useVideo';
 import { useAppointments } from '../../hooks/useAppointments';
+import  { useVideoRTC }  from '../../hooks/useWebRTC';
 import { useAuthStore } from '../../store/authStore';
 import { toast } from 'react-toastify';
+import { sendSignal,fetchSignals } from '../../lib/api/webrtc';
 
 interface VideoPageProps {
   params: {
@@ -68,7 +70,72 @@ export default function VideoPage({ params }: VideoPageProps) {
   
   // Track patient admission status
   const [patientAdmitted, setPatientAdmitted] = useState<boolean>(false);
-  
+  const remoteStreamRef = useRef<HTMLVideoElement>(null);
+  const [incomingSignal, setIncomingSignal] = useState<any>(null); // ce sera rempli via ton backend (WebSocket ou API polling)
+const rtc = useRef<{ handleSignal: (data: any) => void } | null>(null);
+const lastSignalTimestampRef = useRef<number>(0);
+
+// Poll for incoming signals
+// ───────────────────────────────────────────────────────
+// 3️⃣ Poll the backend every 2 seconds for new ICE/SDP
+// ───────────────────────────────────────────────────────
+useEffect(() => {
+  if (!user.token) return;
+
+  const interval = setInterval(async () => {
+    const signals = await fetchSignals(
+      params.appointmentId,
+      lastSignalTimestampRef.current,
+      user.token
+    );
+
+    for (const sig of signals) {
+      // feed each into your peer
+      rtc.current?.handleSignal(sig);
+
+      // update last timestamp so next poll only fetches newer
+      if (sig.timestamp! > lastSignalTimestampRef.current) {
+        lastSignalTimestampRef.current = sig.timestamp!;
+      }
+    }
+  }, 2000);
+
+  return () => {
+    clearInterval(interval);
+  };
+}, [params.appointmentId, user.token]);
+
+// ───────────────────────────────────────────────────────
+// 2️⃣ When you have `localStream && session && appointment`
+// ───────────────────────────────────────────────────────
+useEffect(() => {
+  if (!localStream || !session || !appointment) return;
+
+  rtc.current = useVideoRTC({
+    localStream,
+    iceServers: session.webrtcConfig?.iceServers || [],
+    userId: user.userId,
+    peerId: isDoctor
+      ? appointment.patientId!
+      : appointment.doctorId!,
+    isCaller: isDoctor,
+
+    // 🔑 THIS is where you MUST call sendSignal(...)
+    sendSignal: async (data) => {
+      // `data` is { type:'offer'|'answer'|'candidate', sdp?, candidate? }
+      const withTs = { ...data, timestamp: Date.now() };
+      await sendSignal(params.appointmentId, withTs, user.token);
+    },
+
+    onRemoteStream: (stream) => {
+      if (remoteStreamRef.current) {
+        remoteStreamRef.current.srcObject = stream;
+      }
+    },
+  });
+}, [localStream, session, appointment]);
+
+
   // Handle authentication errors
   useEffect(() => {
     if (error && (error.includes('session has expired') || error.includes('Invalid authentication'))) {
@@ -216,107 +283,43 @@ export default function VideoPage({ params }: VideoPageProps) {
   }, [isCallActive, appointment, isDoctor, user, participants]);
   
   // Initialize video session with better error handling
-  useEffect(() => {
-    const initSession = async () => {
-      if (!appointment || !user || sessionInitialized.current) return;
-      
-      sessionInitialized.current = true;
-      
-      try {
-        console.log("Initializing video session...");
-        // Try to get an existing session first
-        const existingSession = await getVideoSession(params.appointmentId);
-        
-        if (!existingSession) {
-          console.log("No existing session, creating or joining...");
-          // If no session exists and user is a doctor, create one
-          if (isDoctor) {
-            console.log("User is doctor, creating session...");
-            const created = await createVideoSession(params.appointmentId);
-            if (!created && error) {
-              console.error("Failed to create session:", error);
-              if (error.includes('session has expired') || error.includes('Invalid authentication')) {
-                // Let the error effect handler deal with this
-                return;
-              }
-            }
-            // After creating the session, doctor is automatically in the call
-            setIsCallActive(true);
-            
-            // Set doctor as ready for waiting room
-            if (created) {
-              console.log("Doctor session created successfully, now active in call");
-            }
-          } else {
-            console.log("User is patient, joining waiting room...");
-            // If user is a patient and there's no session, they can't join yet
-            // We'll show a message that they need to wait for the doctor to start the call
-            toast.info("Please wait for the doctor to start the video call session");
-            
-            // Stop showing loading/checking state and return to appointment page
-            setIsCallActive(false);
-            setIsWaiting(false);
-            router.push(`/appointments/${params.appointmentId}`);
-            return;
-          }
+ useEffect(() => {
+  const initSession = async () => {
+    if (!appointment || !user || sessionInitialized.current) return;
+    sessionInitialized.current = true;
+
+    try {
+      const existing = await getVideoSession(params.appointmentId);
+      if (!existing) {
+        // doctor not started yet
+        if (!isDoctor) {
+          setIsWaiting(true); // show waiting UI
         } else {
-          console.log("Found existing session:", 
-            {
-              sessionId: existingSession.sessionId,
-              status: existingSession.status,
-              patientId: existingSession.patientId,
-              doctorId: existingSession.doctorId
-            });
-          
-          // If user is a doctor and they're returning to an existing session
-          if (isDoctor) {
-            console.log("Doctor rejoining existing session");
-            setIsCallActive(true);
-          } else {
-            // If user is a patient, they need to join the waiting room
-            console.log("Patient joining existing session");
-            
-            // Check if there's a waiting room enabled flag in the webrtcConfig
-            const waitingRoomEnabled = existingSession.webrtcConfig?.waitingRoomEnabled;
-            
-            if (waitingRoomEnabled === false) {
-              // If waiting room is disabled, patient can directly join call
-              console.log("Waiting room is disabled, patient can directly join call");
-              setIsCallActive(true);
-              setIsWaiting(false);
-              setPatientAdmitted(true);
-              return;
-            }
-            
-            const joined = await joinWaitingRoom(params.appointmentId);
-            if (!joined && error) {
-              console.error("Failed to join waiting room:", error);
-              if (error.includes('session has expired') || error.includes('Invalid authentication')) {
-                // Let the error effect handler deal with this
-                return;
-              }
-              toast.error("Failed to join waiting room. Please try again.");
-              setIsCallActive(false);
-              setIsWaiting(false);
-              router.push(`/appointments/${params.appointmentId}`);
-              return;
-            }
-            setIsWaiting(true);
-            
-            // Start polling for admission status
-            console.log("Patient added to waiting room, polling for admission status");
-          }
+          // doctor creates immediately
+          await createVideoSession(params.appointmentId);
+          setIsCallActive(true);
         }
-      } catch (err) {
-        console.error("Error initializing video session:", err);
-        toast.error("There was an error setting up the video call. Please try again.");
-        setIsCallActive(false);
-        setIsWaiting(false);
+        return;
       }
-    };
-    
-    initSession();
-  }, [params.appointmentId, appointment, isDoctor, user, createVideoSession, getVideoSession, joinWaitingRoom, error, router]);
+
+      if (isDoctor) {
+        setIsCallActive(true);
+      } else {
+        const disabled = existing.webrtcConfig?.waitingRoomEnabled === false;
+        if (disabled) {
+          setIsCallActive(true);
+          setPatientAdmitted(true);
+        } else {
+          setIsWaiting(true);
+        }
+      }
+    } catch (e) {
+      console.error(e);
+      toast.error("Error setting up call");
+    }
+  };
+  initSession();
+}, [params.appointmentId, appointment, isDoctor, user, createVideoSession, getVideoSession, joinWaitingRoom, error, router]);
   
   // Modify the useEffect that checks for admission status to handle rate limiting
   useEffect(() => {
@@ -433,7 +436,13 @@ export default function VideoPage({ params }: VideoPageProps) {
       }
     };
   }, [isWaiting, isDoctor, params.appointmentId, getVideoSession, user?.userId, router, patientAdmitted]);
-  
+useEffect(() => {
+  if (incomingSignal && rtc.current) {
+    rtc.current.handleSignal(incomingSignal);
+  }
+}, [incomingSignal]);
+
+
   // Update the handleReadyForCall function to handle rate limiting
   const handleReadyForCall = async () => {
     try {
@@ -860,53 +869,35 @@ export default function VideoPage({ params }: VideoPageProps) {
         </header>
         
         <main className="flex-1 bg-gray-50 overflow-auto p-4">
-          {isCallActive ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 h-full">
-              {participants.map((participant) => (
-                <div key={participant.userId} className={`${participant.userId === user?.userId ? 'md:order-2' : 'md:order-1'}`}>
-                  <ParticipantVideo
-                    stream={participant.stream}
-                    name={participant.name}
-                    isSelf={participant.userId === user?.userId}
-                    isSpeaking={participant.isSpeaking}
-                    isMuted={participant.isMuted}
-                    isCameraOff={participant.isCameraOff}
-                    isSmall={false}
-                  />
-                </div>
-              ))}
-            </div>
-          ) : isDoctor ? (
-            <div className="h-full flex items-center justify-center">
-              <div className="max-w-lg w-full">
-                <DoctorWaitingRoom
-                  waitingPatients={waitingPatients}
-                  onAdmitPatient={handleAdmitPatient}
-                />
-              </div>
-            </div>
-          ) : (
-            <div className="h-full flex items-center justify-center">
-              <div className="text-center">
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.9 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="bg-white p-8 rounded-xl shadow-md"
-                >
-                  <div className="w-20 h-20 mx-auto bg-primary-100 rounded-full flex items-center justify-center mb-4">
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-10 w-10 text-primary-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                    </svg>
-                  </div>
-                  <h2 className="text-2xl font-bold text-gray-900 mb-2">Initializing Call</h2>
-                  <p className="text-gray-600 mb-6">Please wait while we set up your video call...</p>
-                  <div className="flex justify-center">
-                    <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-l-2 border-primary-600"></div>
-                  </div>
-                </motion.div>
-              </div>
-            </div>
-          )}
+        
+          {participants.map((participant) => (
+  <div key={participant.userId}>
+    <ParticipantVideo
+      stream={participant.stream}
+      name={participant.name}
+      isSelf={participant.userId === user?.userId}
+      isSpeaking={participant.isSpeaking}
+      isMuted={participant.isMuted}
+      isCameraOff={participant.isCameraOff}
+      isSmall={false}
+    />
+  </div>
+))}
+
+{/* Flux distant ajouté manuellement */}
+{isCallActive && (
+  <div>
+    <video
+      ref={remoteStreamRef}
+      autoPlay
+      playsInline
+      muted={false}
+      className="rounded-xl shadow w-full"
+    />
+  </div>
+)}
+
+
         </main>
         
         {isCallActive && (
